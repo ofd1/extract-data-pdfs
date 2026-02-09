@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import time
+import zipfile
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -35,12 +37,15 @@ async def health() -> dict[str, str]:
 
 @app.post("/extract")
 async def extract_endpoint(
-    files: list[UploadFile] = File(..., description="One or more PDF files"),
+    files: list[UploadFile] = File(..., description="One or more PDF or ZIP files"),
 ) -> Response:
     """Main extraction endpoint.
 
+    Accepts PDF files and/or ZIP archives containing PDFs.
+    PDFs inside a ZIP are sorted alphabetically to guarantee order.
+
     Flow:
-    1. Read all uploaded PDFs in order.
+    1. Read uploads — extract PDFs from ZIPs if needed.
     2. Split each PDF into single-page PDFs (preserving order).
     3. Send each page to Gemini sequentially (to preserve order and avoid rate limits).
     4. Consolidate and deduplicate results.
@@ -49,22 +54,55 @@ async def extract_endpoint(
     if not files:
         raise HTTPException(status_code=400, detail="No PDF files uploaded.")
 
-    logger.info("Received %d PDF file(s)", len(files))
+    logger.info("Received %d file(s)", len(files))
 
-    # ── Step 1+2: Read and split ──────────────────────────────────────────
-    all_pages: list[tuple[bytes, str]] = []  # (page_bytes, label)
+    # ── Step 1+2: Read uploads, unzip if needed, and split ────────────────
+    # Build ordered list of (pdf_bytes, source_name) from uploads.
+    # ZIP files are extracted; PDFs sorted alphabetically within each ZIP.
+    pdf_inputs: list[tuple[bytes, str]] = []
 
-    for file_idx, upload in enumerate(files, start=1):
-        filename = upload.filename or f"file{file_idx}"
+    for upload in files:
+        raw = await upload.read()
+        filename = upload.filename or "unknown"
         content_type = upload.content_type or ""
-        if "pdf" not in content_type and not filename.lower().endswith(".pdf"):
+
+        is_zip = (
+            filename.lower().endswith(".zip")
+            or "zip" in content_type
+        )
+
+        if is_zip:
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(raw))
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail=f"File '{filename}' is not a valid ZIP.")
+            # Sort entries alphabetically to guarantee deterministic order
+            pdf_names = sorted(
+                n for n in zf.namelist()
+                if n.lower().endswith(".pdf") and not n.startswith("__MACOSX")
+            )
+            if not pdf_names:
+                raise HTTPException(status_code=400, detail=f"ZIP '{filename}' contains no PDF files.")
+            logger.info("ZIP '%s': found %d PDF(s)", filename, len(pdf_names))
+            for name in pdf_names:
+                pdf_inputs.append((zf.read(name), name))
+            zf.close()
+        elif "pdf" in content_type or filename.lower().endswith(".pdf"):
+            pdf_inputs.append((raw, filename))
+        else:
             raise HTTPException(
                 status_code=400,
-                detail=f"File '{filename}' is not a PDF (content-type: {content_type}).",
+                detail=f"File '{filename}' is not a PDF or ZIP (content-type: {content_type}).",
             )
 
-        pdf_bytes = await upload.read()
-        logger.info("File %d (%s): %d bytes", file_idx, filename, len(pdf_bytes))
+    if not pdf_inputs:
+        raise HTTPException(status_code=400, detail="No PDF files found in the upload.")
+
+    # Split each PDF into single pages
+    all_pages: list[tuple[bytes, str]] = []  # (page_bytes, label)
+
+    for file_idx, (pdf_bytes, source_name) in enumerate(pdf_inputs, start=1):
+        logger.info("File %d (%s): %d bytes", file_idx, source_name, len(pdf_bytes))
 
         pages = split_pdf_to_pages(pdf_bytes)
         logger.info("File %d split into %d pages", file_idx, len(pages))
