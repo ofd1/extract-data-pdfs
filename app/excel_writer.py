@@ -15,8 +15,10 @@ MACRO_FONT = Font(bold=True)
 
 COLUMNS = [
     ("Tipo", 8),
+    ("Periodo", 16),
     ("Conta", 45),
     ("Mascara_Contabil", 20),
+    ("Conta_Padronizada", 45),
     ("Ano_Anterior", 18),
     ("Ano_Atual", 18),
     ("Macro", 8),
@@ -64,7 +66,7 @@ def build_xlsx(rows: list[dict]) -> bytes:
 
     # Auto-filter
     if rows:
-        ws.auto_filter.ref = f"A1:G{len(rows) + 1}"
+        ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
 
     # Freeze header row
     ws.freeze_panes = "A2"

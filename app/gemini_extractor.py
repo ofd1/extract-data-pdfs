@@ -17,27 +17,66 @@ EXTRACTION_PROMPT = """\
 Extraia TODAS as linhas do balancete contábil desta página.
 Retorne um JSON no formato:
 {
+  "periodo": "09/2023",
   "type": "BP",
   "ano_atual": "2024",
   "ano_anterior": "2023",
   "rows": [
     {
-      "Conta": "nome da conta",
-      "Mascara_Contabil": "1.1.01.01",
-      "Ano_Anterior": 1000,
-      "Ano_Atual": 1500,
+      "Conta": "Caixa e Equivalentes",
+      "Mascara_Contabil": "1.01.01",
+      "Ano_Anterior": 1234.56,
+      "Ano_Atual": 5678.90,
       "Macro": false
     }
   ]
 }
+
 REGRAS:
-- "type" deve ser inferido do conteúdo: "BP" para Balanço Patrimonial, "DRE" para Demonstração do Resultado, ou o tipo que melhor se encaixar.
-- "ano_atual" e "ano_anterior" devem ser os anos exibidos nas colunas do balancete (ex: "2024", "2023"). Se não houver ano anterior, use "".
-- Extraia TODAS as linhas visíveis, sem omitir nenhuma.
-- Use apenas números (sem R$, pontos de milhar ou vírgulas decimais — converta 1.234,56 para 123456).
-- Macro = true se a linha for título, subtotal ou total de grupo.
-- Se não houver valor, use 0.
-- Retorne APENAS o JSON válido, sem explicações, sem markdown, sem ```json.
+
+1. PERIODO:
+   - Identifique o período de referência no cabeçalho do documento.
+   - Formatos aceitos: "MM/YYYY" (mensal), "YYYY" (anual), "MM/YYYY a MM/YYYY" (intervalo).
+   - Se não encontrar, use "".
+
+2. TYPE — use APENAS estes valores:
+   - "DRE" se o conteúdo for Demonstração do Resultado (palavras-chave: Receita, Despesa, Custo, Resultado Operacional, Lucro, Prejuízo).
+   - "BP" para todo o resto (Balanço Patrimonial, Balancete, Ativo, Passivo, Patrimônio Líquido).
+
+3. ANOS:
+   - "ano_atual" e "ano_anterior" são os anos exibidos nas colunas (ex: "2024", "2023").
+   - Se não houver ano anterior, use "".
+
+4. VALORES MONETÁRIOS — CRÍTICO:
+   - Retorne números decimais usando PONTO como separador decimal.
+   - Remova R$, pontos de milhar, e converta vírgula decimal para ponto.
+   - Exemplos:
+     R$ 1.234,56  → 1234.56
+     R$ 10.500,00 → 10500.00
+     415.883,97   → 415883.97
+     (1.234,56)   → -1234.56
+     0,00         → 0
+   - NÃO remova os centavos. 1.234,56 NÃO é 123456.
+
+5. CONTA — extraia APENAS o nome descritivo:
+   - Remova códigos numéricos e máscaras contábeis do início.
+   - Exemplos:
+     Errado: "1002518 1.01.02.001 CLAUDIO ROSSI" → Certo: "CLAUDIO ROSSI"
+     Errado: "310749 1.01.02.001 Companhia Uci"  → Certo: "Companhia Uci"
+     Correto: "Caixa e Equivalentes de Caixa"
+
+6. MASCARA_CONTABIL:
+   - Extraia o código hierárquico (ex: "1", "1.01", "1.01.01", "1.01.01.001").
+   - Se não houver máscara visível, use "".
+
+7. MACRO:
+   - true se a linha for título de grupo, subtotal ou total.
+   - false para contas analíticas (folha/detalhe).
+
+8. GERAL:
+   - Extraia TODAS as linhas visíveis, sem omitir nenhuma.
+   - Se não houver valor, use 0.
+   - Retorne APENAS o JSON válido, sem explicações, sem markdown, sem ```json.
 """
 
 # Retry config
@@ -85,7 +124,13 @@ def extract_page(pdf_bytes: bytes, page_label: str = "") -> dict:
                 contents=[pdf_part, EXTRACTION_PROMPT],
             )
             result = _parse_json_response(response.text)
-            logger.info("Extracted %s: %d rows", page_label, len(result.get("rows", [])))
+            logger.info(
+                "Extracted %s: type=%s, periodo=%s, %d rows",
+                page_label,
+                result.get("type", "?"),
+                result.get("periodo", "?"),
+                len(result.get("rows", [])),
+            )
             return result
         except json.JSONDecodeError as exc:
             logger.warning(

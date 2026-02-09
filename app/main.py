@@ -15,7 +15,9 @@ from fastapi.responses import Response
 from .consolidator import consolidate, deduplicate
 from .excel_writer import build_xlsx
 from .gemini_extractor import extract_page
+from .mascara_generator import gerar_mascaras, verificar_mascaras
 from .pdf_splitter import split_pdf_to_pages
+from .validators import validar_extracao
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,13 +124,33 @@ async def extract_endpoint(
         t0 = time.time()
         result = extract_page(page_bytes, page_label=label)
         elapsed = time.time() - t0
-        logger.info("Extracted %s in %.1fs (%d rows)", label, elapsed, len(result.get("rows", [])))
-        extractions.append(result)
-        labels.append(label)
+
+        # Validate extraction
+        is_valid, warnings = validar_extracao(result, label)
+        logger.info(
+            "Extracted %s in %.1fs — type=%s, periodo=%s, %d rows, %d warnings",
+            label, elapsed,
+            result.get("type", "?"),
+            result.get("periodo", "?"),
+            len(result.get("rows", [])),
+            len(warnings),
+        )
+
+        if is_valid:
+            extractions.append(result)
+            labels.append(label)
+        else:
+            logger.error("Skipping %s — structurally invalid extraction", label)
 
     # ── Step 4: Consolidate ───────────────────────────────────────────────
     rows = consolidate(extractions, labels)
     logger.info("Consolidated: %d rows before dedup", len(rows))
+
+    # Check and generate missing accounting masks
+    all_have_masks, missing_count = verificar_mascaras(rows)
+    if not all_have_masks:
+        logger.info("Generating masks for %d rows…", missing_count)
+        rows = gerar_mascaras(rows)
 
     rows = deduplicate(rows)
     logger.info("After dedup: %d rows", len(rows))
