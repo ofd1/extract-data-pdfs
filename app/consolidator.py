@@ -64,6 +64,39 @@ def normalize_number(raw: Any) -> float:
     return -val if negative else val
 
 
+_DRE_KEYWORDS = ("receita", "despesa", "custo", "resultado", "dre", "demonstra", "lucro", "prejuízo")
+
+
+def _normalize_tipo(tipo: str) -> str:
+    """Map any variant of the type field to 'BP' or 'DRE'."""
+    t = tipo.strip().upper()
+    if t == "DRE":
+        return "DRE"
+    low = tipo.lower()
+    if any(kw in low for kw in _DRE_KEYWORDS):
+        return "DRE"
+    return "BP"
+
+
+def _clean_conta(conta: str) -> str:
+    """Remove leading numeric codes and accounting masks from account names.
+
+    Examples:
+        "1002518 1.01.02.001.001 CLAUDIO ROSSI" → "CLAUDIO ROSSI"
+        "310749 1.01.02.001 Companhia Uci"      → "Companhia Uci"
+        "Caixa e Equivalentes"                   → "Caixa e Equivalentes"
+    """
+    # Pattern: optional digits, optional mask (digits+dots), then the name
+    m = re.match(r'^\d+\s+[\d.]+\s+(.+)$', conta)
+    if m:
+        return m.group(1).strip()
+    # Also handle: just a mask prefix like "1.01.01 Caixa"
+    m2 = re.match(r'^[\d.]+\s+(.+)$', conta)
+    if m2 and not conta[0].isalpha():
+        return m2.group(1).strip()
+    return conta
+
+
 def consolidate(
     extractions: list[dict],
     page_labels: list[str],
@@ -77,25 +110,28 @@ def consolidate(
 
     Returns:
         List of row dicts ready for Excel:
-          Tipo, Conta, Mascara_Contabil, Ano_Anterior, Ano_Atual, Macro, Pagina_Origem
+          Tipo, Periodo, Conta, Mascara_Contabil, Conta_Padronizada,
+          Ano_Anterior, Ano_Atual, Macro, Pagina_Origem
     """
     rows: list[dict] = []
 
     for extraction, label in zip(extractions, page_labels):
-        tipo = extraction.get("type", "")
+        tipo = _normalize_tipo(extraction.get("type", ""))
+        periodo = str(extraction.get("periodo", "")).strip()
         ano_atual = extraction.get("ano_atual", "")
         ano_anterior = extraction.get("ano_anterior", "")
 
         for row in extraction.get("rows", []):
             rows.append({
                 "Tipo": tipo,
-                "Conta": str(row.get("Conta", "")).strip(),
+                "Periodo": periodo,
+                "Conta": _clean_conta(str(row.get("Conta", "")).strip()),
                 "Mascara_Contabil": str(row.get("Mascara_Contabil", "")).strip(),
+                "Conta_Padronizada": "",
                 "Ano_Anterior": normalize_number(row.get("Ano_Anterior", 0)),
                 "Ano_Atual": normalize_number(row.get("Ano_Atual", 0)),
                 "Macro": bool(row.get("Macro", False)),
                 "Pagina_Origem": label,
-                # Keep year labels for the Excel header
                 "_ano_atual_label": ano_atual,
                 "_ano_anterior_label": ano_anterior,
             })
