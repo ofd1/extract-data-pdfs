@@ -47,9 +47,6 @@ Retorne APENAS o JSON válido, sem explicações.
 def verificar_mascaras(rows: list[dict]) -> tuple[bool, int]:
     """Check how many rows are missing accounting masks.
 
-    Only checks non-Macro rows, since totals/subtotals sometimes
-    legitimately lack masks.
-
     Returns:
         (all_have_masks, count_missing)
     """
@@ -83,7 +80,6 @@ def gerar_mascaras(rows: list[dict]) -> list[dict]:
             "index": i,
             "Conta": row.get("Conta", ""),
             "Mascara_Contabil": row.get("Mascara_Contabil", ""),
-            "Macro": row.get("Macro", False),
             "Tipo": row.get("Tipo", ""),
         })
 

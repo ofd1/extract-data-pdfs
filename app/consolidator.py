@@ -111,7 +111,7 @@ def consolidate(
     Returns:
         List of row dicts ready for Excel:
           Tipo, Periodo, Conta, Mascara_Contabil, Conta_Padronizada,
-          Ano_Anterior, Ano_Atual, Macro, Pagina_Origem
+          Sinal, Classificacao_Padrao, Ano_Anterior, Ano_Atual, Pagina_Origem
     """
     rows: list[dict] = []
 
@@ -128,9 +128,10 @@ def consolidate(
                 "Conta": _clean_conta(str(row.get("Conta", "")).strip()),
                 "Mascara_Contabil": str(row.get("Mascara_Contabil", "")).strip(),
                 "Conta_Padronizada": "",
+                "Sinal": "",
+                "Classificacao_Padrao": "",
                 "Ano_Anterior": normalize_number(row.get("Ano_Anterior", 0)),
                 "Ano_Atual": normalize_number(row.get("Ano_Atual", 0)),
-                "Macro": bool(row.get("Macro", False)),
                 "Pagina_Origem": label,
                 "_ano_atual_label": ano_atual,
                 "_ano_anterior_label": ano_anterior,

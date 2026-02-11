@@ -100,8 +100,10 @@ async def extract_endpoint(
     if not pdf_inputs:
         raise HTTPException(status_code=400, detail="No PDF files found in the upload.")
 
-    # Split each PDF into single pages
-    all_pages: list[tuple[bytes, str]] = []  # (page_bytes, label)
+    # Split each PDF into single pages.
+    # Track which file_idx each page belongs to so the period extracted
+    # from the first page of a PDF is propagated to the remaining pages.
+    all_pages: list[tuple[bytes, str, int]] = []  # (page_bytes, label, file_idx)
 
     for file_idx, (pdf_bytes, source_name) in enumerate(pdf_inputs, start=1):
         logger.info("File %d (%s): %d bytes", file_idx, source_name, len(pdf_bytes))
@@ -111,16 +113,19 @@ async def extract_endpoint(
 
         for page_num, page_bytes in enumerate(pages, start=1):
             label = f"PDF{file_idx}-P{page_num}"
-            all_pages.append((page_bytes, label))
+            all_pages.append((page_bytes, label, file_idx))
 
     logger.info("Total pages to process: %d", len(all_pages))
 
     # ── Step 3: Extract via Gemini (sequential to preserve order) ─────────
+    # The period is locked per PDF: extracted from the first page of each
+    # PDF and propagated to all subsequent pages of that same PDF.
     extractions: list[dict] = []
     labels: list[str] = []
     contexto_anterior = ""
+    periodo_por_pdf: dict[int, str] = {}  # file_idx → locked periodo
 
-    for page_bytes, label in all_pages:
+    for page_bytes, label, file_idx in all_pages:
         logger.info("Processing %s …", label)
         t0 = time.time()
         result = extract_page(
@@ -129,6 +134,15 @@ async def extract_endpoint(
             contexto_anterior=contexto_anterior,
         )
         elapsed = time.time() - t0
+
+        # Lock periodo from the first page of each PDF
+        periodo_raw = str(result.get("periodo", "")).strip()
+        if file_idx not in periodo_por_pdf and periodo_raw:
+            periodo_por_pdf[file_idx] = periodo_raw
+            logger.info("PDF%d periodo locked: %s", file_idx, periodo_raw)
+        # Override with locked periodo so all pages of the same PDF match
+        if file_idx in periodo_por_pdf:
+            result["periodo"] = periodo_por_pdf[file_idx]
 
         # Validate extraction
         is_valid, warnings = validar_extracao(result, label)
