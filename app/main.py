@@ -18,6 +18,7 @@ from .gemini_extractor import build_context_summary, extract_page
 from .mascara_generator import gerar_mascaras, verificar_mascaras
 from .pdf_splitter import split_pdf_to_pages
 from .validators import validar_extracao
+from .arithmetic_validator import validar_aritmetica
 
 logging.basicConfig(
     level=logging.INFO,
@@ -240,6 +241,11 @@ async def extract_endpoint(
 
     rows = deduplicate(rows)
     logger.info("After dedup: %d rows", len(rows))
+
+    # Arithmetic validation
+    arithmetic_errors = validar_aritmetica(rows)
+    all_errors.extend(arithmetic_errors)
+    logger.info("Arithmetic validation: %d inconsistencies found", len(arithmetic_errors))
 
     # ── Step 5: Generate XLSX ─────────────────────────────────────────────
     xlsx_bytes = build_xlsx(rows, errors=all_errors)
