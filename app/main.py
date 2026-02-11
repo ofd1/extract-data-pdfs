@@ -19,6 +19,7 @@ from .mascara_generator import gerar_mascaras, verificar_mascaras
 from .pdf_splitter import split_pdf_to_pages
 from .validators import validar_extracao
 from .arithmetic_validator import validar_aritmetica
+from .classifier import classificar_contas
 
 logging.basicConfig(
     level=logging.INFO,
@@ -246,6 +247,13 @@ async def extract_endpoint(
     arithmetic_errors = validar_aritmetica(rows)
     all_errors.extend(arithmetic_errors)
     logger.info("Arithmetic validation: %d inconsistencies found", len(arithmetic_errors))
+
+    # Classify accounts against standard chart
+    try:
+        rows = classificar_contas(rows)
+        logger.info("Classification complete")
+    except Exception as exc:
+        logger.error("Classification failed (continuing without): %s", exc)
 
     # ── Step 5: Generate XLSX ─────────────────────────────────────────────
     xlsx_bytes = build_xlsx(rows, errors=all_errors)
