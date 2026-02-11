@@ -10,8 +10,6 @@ from openpyxl.styles import Alignment, Font, PatternFill, numbers
 
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
 HEADER_FILL = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
-MACRO_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
-MACRO_FONT = Font(bold=True)
 
 COLUMNS = [
     ("Tipo", 8),
@@ -19,18 +17,20 @@ COLUMNS = [
     ("Conta", 45),
     ("Mascara_Contabil", 20),
     ("Conta_Padronizada", 45),
+    ("Sinal", 10),
+    ("Classificacao_Padrao", 30),
     ("Ano_Anterior", 18),
     ("Ano_Atual", 18),
-    ("Macro", 8),
     ("Pagina_Origem", 16),
 ]
 
 
-def build_xlsx(rows: list[dict]) -> bytes:
+def build_xlsx(rows: list[dict], errors: list[dict] | None = None) -> bytes:
     """Create an XLSX file in memory and return its bytes.
 
     Args:
         rows: Consolidated row dicts with keys matching COLUMNS.
+        errors: Optional list of extraction errors (will be used in a future update).
 
     Returns:
         Raw bytes of the .xlsx file.
@@ -49,15 +49,9 @@ def build_xlsx(rows: list[dict]) -> bytes:
 
     # --- Data rows ---
     for row_idx, row in enumerate(rows, start=2):
-        is_macro = row.get("Macro", False)
-
         for col_idx, (col_name, _) in enumerate(COLUMNS, start=1):
             value = row.get(col_name, "")
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
-
-            if is_macro:
-                cell.font = MACRO_FONT
-                cell.fill = MACRO_FILL
 
             # Number formatting for monetary columns
             if col_name in ("Ano_Anterior", "Ano_Atual"):
@@ -65,8 +59,10 @@ def build_xlsx(rows: list[dict]) -> bytes:
                 cell.alignment = Alignment(horizontal="right")
 
     # Auto-filter
+    num_cols = len(COLUMNS)
+    last_col_letter = chr(ord("A") + num_cols - 1)
     if rows:
-        ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
+        ws.auto_filter.ref = f"A1:{last_col_letter}{len(rows) + 1}"
 
     # Freeze header row
     ws.freeze_panes = "A2"
