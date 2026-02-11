@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 
+from .arithmetic_validator import validar_aritmetica
 from .consolidator import consolidate, deduplicate
 from .excel_writer import build_xlsx
 from .gemini_extractor import build_context_summary, extract_page
@@ -240,6 +241,11 @@ async def extract_endpoint(
 
     rows = deduplicate(rows)
     logger.info("After dedup: %d rows", len(rows))
+
+    # ── Step 4b: Arithmetic validation ────────────────────────────────────
+    arithmetic_errors = validar_aritmetica(rows)
+    all_errors.extend(arithmetic_errors)
+    logger.info("Arithmetic validation: %d inconsistencies found", len(arithmetic_errors))
 
     # ── Step 5: Generate XLSX ─────────────────────────────────────────────
     xlsx_bytes = build_xlsx(rows, errors=all_errors)
