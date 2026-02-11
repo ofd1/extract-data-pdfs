@@ -3,18 +3,26 @@
 Backend Python que recebe PDFs de balancetes contábeis, extrai dados via Gemini AI e devolve um Excel consolidado.
 
 ## Arquitetura
-
-```
 Lovable → n8n (ponte) → POST /extract (este backend) → XLSX response
-```
 
 ### Fluxo interno
 
-1. Recebe 1+ PDFs via `multipart/form-data`
+1. Recebe 1+ PDFs (ou ZIPs contendo PDFs) via `multipart/form-data`
 2. Divide cada PDF em páginas individuais (PyMuPDF)
-3. Envia cada página ao Gemini API com prompt de extração
-4. Normaliza números e consolida todas as linhas
-5. Gera XLSX e retorna como download
+3. Processa PDFs em **paralelo** (páginas dentro de cada PDF são sequenciais, com contexto da página anterior)
+4. Normaliza números, consolida e deduplica todas as linhas
+5. Valida somas aritméticas (conta-pai = soma dos filhos via máscara contábil)
+6. Classifica contas analíticas contra o Plano de Contas Padrão (De-Para via IA)
+7. Gera XLSX com aba de dados e aba de relatório de erros
+
+## Features
+
+- **Contexto entre páginas**: Resumo da página N é passado para N+1 do mesmo PDF, melhorando extração de tabelas longas.
+- **Processamento paralelo**: Múltiplos PDFs são processados simultaneamente (até 4 threads).
+- **Threshold inteligente para máscaras**: Só gera máscaras via IA se ≥80% estiverem faltando (indica que o documento original não tem códigos). Se poucas faltam, assume erro pontual e ignora.
+- **Validação aritmética**: Verifica que contas-pai = soma das contas-filhas usando a hierarquia de máscaras contábeis.
+- **Classificação De-Para**: Contas analíticas são mapeadas ao Plano de Contas Padrão com sinal (+/-).
+- **Relatório de erros**: Aba separada no Excel lista páginas com falha, extrações inválidas e inconsistências aritméticas.
 
 ## Deploy no Railway
 
@@ -39,19 +47,27 @@ Health check. Retorna `{"status": "ok"}`.
 ### `POST /extract`
 Recebe PDFs e retorna XLSX consolidado.
 
-**Request:** `multipart/form-data` com campo `files` (1 ou mais PDFs).
+**Request:** `multipart/form-data` com campo `files` (1 ou mais PDFs ou ZIPs).
 
-**Response:** arquivo `.xlsx` com colunas:
-- `Tipo` — tipo do demonstrativo (BP, DRE, etc.)
+**Response:** arquivo `.xlsx` com duas abas:
+
+**Aba "Balancete Consolidado"** — colunas:
+- `Tipo` — BP ou DRE
+- `Periodo` — período de referência (MM/YYYY)
 - `Conta` — nome da conta
-- `Mascara_Contabil` — código contábil (ex: 1.1.01.01)
+- `Mascara_Contabil` — código hierárquico (ex: 1.01.01)
+- `Conta_Padronizada` — (reservado para uso futuro)
+- `Sinal` — "+" ou "-" conforme natureza da conta
+- `Classificacao_Padrao` — item do Plano de Contas Padrão (De-Para)
 - `Ano_Anterior` — valor do ano anterior
 - `Ano_Atual` — valor do ano atual
-- `Macro` — true se for linha de título/subtotal
 - `Pagina_Origem` — identificador PDF+página (ex: PDF1-P3)
 
-## Desenvolvimento local
+**Aba "Relatório de Erros"** — colunas:
+- `Página` — identificador da página com problema
+- `Erro` — descrição do erro
 
+## Desenvolvimento local
 ```bash
 pip install -r requirements.txt
 export GEMINI_API_KEY=sua-chave
