@@ -14,7 +14,7 @@ from fastapi.responses import Response
 
 from .consolidator import consolidate, deduplicate
 from .excel_writer import build_xlsx
-from .gemini_extractor import extract_page
+from .gemini_extractor import build_context_summary, extract_page
 from .mascara_generator import gerar_mascaras, verificar_mascaras
 from .pdf_splitter import split_pdf_to_pages
 from .validators import validar_extracao
@@ -118,11 +118,16 @@ async def extract_endpoint(
     # ── Step 3: Extract via Gemini (sequential to preserve order) ─────────
     extractions: list[dict] = []
     labels: list[str] = []
+    contexto_anterior = ""
 
     for page_bytes, label in all_pages:
         logger.info("Processing %s …", label)
         t0 = time.time()
-        result = extract_page(page_bytes, page_label=label)
+        result = extract_page(
+            page_bytes,
+            page_label=label,
+            contexto_anterior=contexto_anterior,
+        )
         elapsed = time.time() - t0
 
         # Validate extraction
@@ -139,6 +144,7 @@ async def extract_endpoint(
         if is_valid:
             extractions.append(result)
             labels.append(label)
+            contexto_anterior = build_context_summary(result)
         else:
             logger.error("Skipping %s — structurally invalid extraction", label)
 
