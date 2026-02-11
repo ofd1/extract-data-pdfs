@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 VALID_TYPES = {"BP", "DRE"}
 
-REQUIRED_ROW_FIELDS = ("Conta", "Mascara_Contabil", "Ano_Anterior", "Ano_Atual", "Macro")
+REQUIRED_ROW_FIELDS = ("Conta", "Mascara_Contabil", "Ano_Anterior", "Ano_Atual")
 
 
 def validar_extracao(extraction: dict, page_label: str) -> tuple[bool, list[str]]:
