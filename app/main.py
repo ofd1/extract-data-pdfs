@@ -7,7 +7,7 @@ import logging
 import os
 import time
 import zipfile
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
@@ -31,10 +31,80 @@ app = FastAPI(
     version="1.0.0",
 )
 
+MASK_GENERATION_THRESHOLD = 0.80  # Only auto-generate masks if ≥80% are missing
+
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _process_pdf_pages(
+    pages: list[tuple[bytes, str]],
+) -> tuple[list[dict], list[str], list[dict]]:
+    """Process all pages of a single PDF sequentially.
+
+    Pages are processed in order so that page context (previous page summary)
+    can be passed to the next page for continuity.
+
+    Args:
+        pages: List of (page_bytes, label) for one PDF, in page order.
+
+    Returns:
+        (extractions, labels, errors) for this PDF.
+    """
+    extractions: list[dict] = []
+    labels: list[str] = []
+    errors: list[dict] = []
+    contexto_anterior = ""
+    locked_periodo = ""
+
+    for page_bytes, label in pages:
+        logger.info("Processing %s …", label)
+        t0 = time.time()
+
+        try:
+            result = extract_page(
+                page_bytes,
+                page_label=label,
+                contexto_anterior=contexto_anterior,
+            )
+        except Exception as exc:
+            elapsed = time.time() - t0
+            logger.error("Error extracting %s after %.1fs: %s", label, elapsed, exc)
+            errors.append({"pagina": label, "erro": str(exc)})
+            continue
+
+        elapsed = time.time() - t0
+
+        # Lock periodo from the first page of this PDF
+        periodo_raw = str(result.get("periodo", "")).strip()
+        if not locked_periodo and periodo_raw:
+            locked_periodo = periodo_raw
+            logger.info("Periodo locked for this PDF: %s", locked_periodo)
+        if locked_periodo:
+            result["periodo"] = locked_periodo
+
+        # Validate extraction
+        is_valid, warnings = validar_extracao(result, label)
+        logger.info(
+            "Extracted %s in %.1fs — type=%s, periodo=%s, %d rows, %d warnings",
+            label, elapsed,
+            result.get("type", "?"),
+            result.get("periodo", "?"),
+            len(result.get("rows", [])),
+            len(warnings),
+        )
+
+        if is_valid:
+            extractions.append(result)
+            labels.append(label)
+            contexto_anterior = build_context_summary(result)
+        else:
+            logger.error("Skipping %s — structurally invalid extraction", label)
+            errors.append({"pagina": label, "erro": "Extração estruturalmente inválida"})
+
+    return extractions, labels, errors
 
 
 @app.post("/extract")
@@ -49,7 +119,7 @@ async def extract_endpoint(
     Flow:
     1. Read uploads — extract PDFs from ZIPs if needed.
     2. Split each PDF into single-page PDFs (preserving order).
-    3. Send each page to Gemini sequentially (to preserve order and avoid rate limits).
+    3. Process PDFs in parallel (pages within each PDF are sequential).
     4. Consolidate and deduplicate results.
     5. Generate XLSX and return it.
     """
@@ -59,8 +129,6 @@ async def extract_endpoint(
     logger.info("Received %d file(s)", len(files))
 
     # ── Step 1+2: Read uploads, unzip if needed, and split ────────────────
-    # Build ordered list of (pdf_bytes, source_name) from uploads.
-    # ZIP files are extracted; PDFs sorted alphabetically within each ZIP.
     pdf_inputs: list[tuple[bytes, str]] = []
 
     for upload in files:
@@ -78,7 +146,6 @@ async def extract_endpoint(
                 zf = zipfile.ZipFile(io.BytesIO(raw))
             except zipfile.BadZipFile:
                 raise HTTPException(status_code=400, detail=f"File '{filename}' is not a valid ZIP.")
-            # Sort entries alphabetically to guarantee deterministic order
             pdf_names = sorted(
                 n for n in zf.namelist()
                 if n.lower().endswith(".pdf") and not n.startswith("__MACOSX")
@@ -100,10 +167,8 @@ async def extract_endpoint(
     if not pdf_inputs:
         raise HTTPException(status_code=400, detail="No PDF files found in the upload.")
 
-    # Split each PDF into single pages.
-    # Track which file_idx each page belongs to so the period extracted
-    # from the first page of a PDF is propagated to the remaining pages.
-    all_pages: list[tuple[bytes, str, int]] = []  # (page_bytes, label, file_idx)
+    # ── Split each PDF and group pages by PDF ─────────────────────────────
+    pdf_groups: list[list[tuple[bytes, str]]] = []  # one group per PDF
 
     for file_idx, (pdf_bytes, source_name) in enumerate(pdf_inputs, start=1):
         logger.info("File %d (%s): %d bytes", file_idx, source_name, len(pdf_bytes))
@@ -111,72 +176,73 @@ async def extract_endpoint(
         pages = split_pdf_to_pages(pdf_bytes)
         logger.info("File %d split into %d pages", file_idx, len(pages))
 
+        group: list[tuple[bytes, str]] = []
         for page_num, page_bytes in enumerate(pages, start=1):
             label = f"PDF{file_idx}-P{page_num}"
-            all_pages.append((page_bytes, label, file_idx))
+            group.append((page_bytes, label))
+        pdf_groups.append(group)
 
-    logger.info("Total pages to process: %d", len(all_pages))
+    total_pages = sum(len(g) for g in pdf_groups)
+    logger.info("Total pages to process: %d across %d PDF(s)", total_pages, len(pdf_groups))
 
-    # ── Step 3: Extract via Gemini (sequential to preserve order) ─────────
-    # The period is locked per PDF: extracted from the first page of each
-    # PDF and propagated to all subsequent pages of that same PDF.
-    extractions: list[dict] = []
-    labels: list[str] = []
-    contexto_anterior = ""
-    periodo_por_pdf: dict[int, str] = {}  # file_idx → locked periodo
+    # ── Step 3: Extract — parallel per PDF, sequential per page ───────────
+    all_extractions: list[dict] = []
+    all_labels: list[str] = []
+    all_errors: list[dict] = []
 
-    for page_bytes, label, file_idx in all_pages:
-        logger.info("Processing %s …", label)
-        t0 = time.time()
-        result = extract_page(
-            page_bytes,
-            page_label=label,
-            contexto_anterior=contexto_anterior,
-        )
-        elapsed = time.time() - t0
+    max_workers = min(len(pdf_groups), 4)
+    if max_workers <= 1:
+        # Single PDF — no need for thread pool overhead
+        ext, lab, err = _process_pdf_pages(pdf_groups[0])
+        all_extractions.extend(ext)
+        all_labels.extend(lab)
+        all_errors.extend(err)
+    else:
+        logger.info("Processing %d PDFs in parallel (max_workers=%d)", len(pdf_groups), max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_process_pdf_pages, group)
+                for group in pdf_groups
+            ]
+            # Collect in original PDF order
+            for future in futures:
+                ext, lab, err = future.result()
+                all_extractions.extend(ext)
+                all_labels.extend(lab)
+                all_errors.extend(err)
 
-        # Lock periodo from the first page of each PDF
-        periodo_raw = str(result.get("periodo", "")).strip()
-        if file_idx not in periodo_por_pdf and periodo_raw:
-            periodo_por_pdf[file_idx] = periodo_raw
-            logger.info("PDF%d periodo locked: %s", file_idx, periodo_raw)
-        # Override with locked periodo so all pages of the same PDF match
-        if file_idx in periodo_por_pdf:
-            result["periodo"] = periodo_por_pdf[file_idx]
-
-        # Validate extraction
-        is_valid, warnings = validar_extracao(result, label)
-        logger.info(
-            "Extracted %s in %.1fs — type=%s, periodo=%s, %d rows, %d warnings",
-            label, elapsed,
-            result.get("type", "?"),
-            result.get("periodo", "?"),
-            len(result.get("rows", [])),
-            len(warnings),
-        )
-
-        if is_valid:
-            extractions.append(result)
-            labels.append(label)
-            contexto_anterior = build_context_summary(result)
-        else:
-            logger.error("Skipping %s — structurally invalid extraction", label)
+    if all_errors:
+        logger.warning("Extraction completed with %d error(s)", len(all_errors))
+        for e in all_errors:
+            logger.warning("  %s: %s", e["pagina"], e["erro"])
 
     # ── Step 4: Consolidate ───────────────────────────────────────────────
-    rows = consolidate(extractions, labels)
+    rows = consolidate(all_extractions, all_labels)
     logger.info("Consolidated: %d rows before dedup", len(rows))
 
-    # Check and generate missing accounting masks
+    # Smart mask threshold: only generate if ≥80% are missing
     all_have_masks, missing_count = verificar_mascaras(rows)
-    if not all_have_masks:
-        logger.info("Generating masks for %d rows…", missing_count)
-        rows = gerar_mascaras(rows)
+    if all_have_masks:
+        logger.info("All rows have masks — skipping generation")
+    elif rows:
+        ratio = missing_count / len(rows)
+        if ratio >= MASK_GENERATION_THRESHOLD:
+            logger.info(
+                "%d/%d rows missing masks (%.0f%%) — generating via AI",
+                missing_count, len(rows), ratio * 100,
+            )
+            rows = gerar_mascaras(rows)
+        else:
+            logger.info(
+                "Only %d/%d rows missing masks (%.0f%%) — skipping AI mask generation (threshold: %.0f%%)",
+                missing_count, len(rows), ratio * 100, MASK_GENERATION_THRESHOLD * 100,
+            )
 
     rows = deduplicate(rows)
     logger.info("After dedup: %d rows", len(rows))
 
     # ── Step 5: Generate XLSX ─────────────────────────────────────────────
-    xlsx_bytes = build_xlsx(rows)
+    xlsx_bytes = build_xlsx(rows, errors=all_errors)
     logger.info("XLSX generated: %d bytes", len(xlsx_bytes))
 
     return Response(

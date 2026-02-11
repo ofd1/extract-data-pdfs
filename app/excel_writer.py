@@ -25,11 +25,12 @@ COLUMNS = [
 ]
 
 
-def build_xlsx(rows: list[dict]) -> bytes:
+def build_xlsx(rows: list[dict], errors: list[dict] | None = None) -> bytes:
     """Create an XLSX file in memory and return its bytes.
 
     Args:
         rows: Consolidated row dicts with keys matching COLUMNS.
+        errors: Optional list of extraction errors (will be used in a future update).
 
     Returns:
         Raw bytes of the .xlsx file.
