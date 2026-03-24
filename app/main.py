@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import time
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from .consolidator import consolidate, deduplicate
 from .excel_writer import build_xlsx
@@ -33,12 +35,54 @@ app = FastAPI(
     version="1.0.0",
 )
 
-MASK_GENERATION_THRESHOLD = 0.80  # Only auto-generate masks if ≥80% are missing
+MASK_GENERATION_THRESHOLD = 0.80  # Only auto-generate masks if >=80% are missing
+
+# ---------------------------------------------------------------------------
+# In-memory job store
+# ---------------------------------------------------------------------------
+jobs: dict[str, dict] = {}
+
+JOB_TTL_SECONDS = 30 * 60  # 30 minutes
+
+
+def _cleanup_old_jobs() -> None:
+    """Remove jobs older than JOB_TTL_SECONDS."""
+    now = time.time()
+    expired = [jid for jid, j in jobs.items() if now - j["created_at"] > JOB_TTL_SECONDS]
+    for jid in expired:
+        del jobs[jid]
+    if expired:
+        logger.info("Cleaned up %d expired job(s)", len(expired))
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/status/{job_id}")
+async def job_status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JSONResponse(content={
+        "status": job["status"],
+        "progress": job["progress"],
+        "message": job["message"],
+        "error": job.get("error"),
+    })
+
+
+@app.get("/download/{job_id}")
+async def download_result(job_id: str):
+    job = jobs.get(job_id)
+    if not job or job["status"] != "done":
+        raise HTTPException(status_code=404, detail="Result not ready")
+    return Response(
+        content=job["xlsx_bytes"],
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="balancete_extraido.xlsx"'},
+    )
 
 
 def _process_pdf_pages(
@@ -62,7 +106,7 @@ def _process_pdf_pages(
     locked_periodo = ""
 
     for page_bytes, label in pages:
-        logger.info("Processing %s …", label)
+        logger.info("Processing %s \u2026", label)
         t0 = time.time()
 
         try:
@@ -90,7 +134,7 @@ def _process_pdf_pages(
         # Validate extraction
         is_valid, warnings = validar_extracao(result, label)
         logger.info(
-            "Extracted %s in %.1fs — type=%s, periodo=%s, %d rows, %d warnings",
+            "Extracted %s in %.1fs \u2014 type=%s, periodo=%s, %d rows, %d warnings",
             label, elapsed,
             result.get("type", "?"),
             result.get("periodo", "?"),
@@ -103,34 +147,152 @@ def _process_pdf_pages(
             labels.append(label)
             contexto_anterior = build_context_summary(result)
         else:
-            logger.error("Skipping %s — structurally invalid extraction", label)
-            errors.append({"pagina": label, "erro": "Extração estruturalmente inválida"})
+            logger.error("Skipping %s \u2014 structurally invalid extraction", label)
+            errors.append({"pagina": label, "erro": "Extra\u00e7\u00e3o estruturalmente inv\u00e1lida"})
 
     return extractions, labels, errors
+
+
+async def _process_job(job_id: str, pdf_inputs: list[tuple[bytes, str]]) -> None:
+    """Background task that performs the heavy extraction work."""
+    try:
+        job = jobs[job_id]
+
+        # -- Step 2: Split PDFs into pages ----------------------------------
+        job["message"] = "Dividindo PDFs em p\u00e1ginas..."
+        job["progress"] = 0.05
+
+        pdf_groups: list[list[tuple[bytes, str]]] = []
+        for file_idx, (pdf_bytes, source_name) in enumerate(pdf_inputs, start=1):
+            logger.info("File %d (%s): %d bytes", file_idx, source_name, len(pdf_bytes))
+            pages = split_pdf_to_pages(pdf_bytes)
+            logger.info("File %d split into %d pages", file_idx, len(pages))
+            group: list[tuple[bytes, str]] = []
+            for page_num, page_bytes in enumerate(pages, start=1):
+                label = f"PDF{file_idx}-P{page_num}"
+                group.append((page_bytes, label))
+            pdf_groups.append(group)
+
+        total_pages = sum(len(g) for g in pdf_groups)
+        logger.info("Total pages to process: %d across %d PDF(s)", total_pages, len(pdf_groups))
+
+        # -- Step 3: Extract ------------------------------------------------
+        job["message"] = "Extraindo dados via IA..."
+        job["progress"] = 0.10
+
+        all_extractions: list[dict] = []
+        all_labels: list[str] = []
+        all_errors: list[dict] = []
+
+        max_workers = min(len(pdf_groups), 4)
+        loop = asyncio.get_running_loop()
+
+        if max_workers <= 1:
+            ext, lab, err = await loop.run_in_executor(None, _process_pdf_pages, pdf_groups[0])
+            all_extractions.extend(ext)
+            all_labels.extend(lab)
+            all_errors.extend(err)
+        else:
+            logger.info("Processing %d PDFs in parallel (max_workers=%d)", len(pdf_groups), max_workers)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    loop.run_in_executor(executor, _process_pdf_pages, group)
+                    for group in pdf_groups
+                ]
+                results = await asyncio.gather(*futures)
+                for ext, lab, err in results:
+                    all_extractions.extend(ext)
+                    all_labels.extend(lab)
+                    all_errors.extend(err)
+
+        job["progress"] = 0.70
+
+        if all_errors:
+            logger.warning("Extraction completed with %d error(s)", len(all_errors))
+            for e in all_errors:
+                logger.warning("  %s: %s", e["pagina"], e["erro"])
+
+        # -- Step 4: Consolidate --------------------------------------------
+        job["message"] = "Consolidando e classificando..."
+        job["progress"] = 0.75
+
+        rows = consolidate(all_extractions, all_labels)
+        logger.info("Consolidated: %d rows before dedup", len(rows))
+
+        all_have_masks, missing_count = verificar_mascaras(rows)
+        if all_have_masks:
+            logger.info("All rows have masks \u2014 skipping generation")
+        elif rows:
+            ratio = missing_count / len(rows)
+            if ratio >= MASK_GENERATION_THRESHOLD:
+                logger.info(
+                    "%d/%d rows missing masks (%.0f%%) \u2014 generating via AI",
+                    missing_count, len(rows), ratio * 100,
+                )
+                rows = gerar_mascaras(rows)
+            else:
+                logger.info(
+                    "Only %d/%d rows missing masks (%.0f%%) \u2014 skipping AI mask generation (threshold: %.0f%%)",
+                    missing_count, len(rows), ratio * 100, MASK_GENERATION_THRESHOLD * 100,
+                )
+
+        rows = deduplicate(rows)
+        logger.info("After dedup: %d rows", len(rows))
+
+        job["progress"] = 0.85
+
+        # Arithmetic validation
+        arithmetic_errors = validar_aritmetica(rows)
+        all_errors.extend(arithmetic_errors)
+        logger.info("Arithmetic validation: %d inconsistencies found", len(arithmetic_errors))
+
+        # Classify accounts against standard chart
+        try:
+            rows = classificar_contas(rows)
+            logger.info("Classification complete")
+        except Exception as exc:
+            logger.error("Classification failed (continuing without): %s", exc)
+
+        job["progress"] = 0.90
+
+        # -- Step 5: Generate XLSX ------------------------------------------
+        job["message"] = "Gerando Excel..."
+        job["progress"] = 0.95
+
+        xlsx_bytes = build_xlsx(rows, errors=all_errors)
+        logger.info("XLSX generated: %d bytes", len(xlsx_bytes))
+
+        job["xlsx_bytes"] = xlsx_bytes
+        job["status"] = "done"
+        job["progress"] = 1.0
+        job["message"] = "Conclu\u00eddo"
+
+    except Exception as e:
+        logger.exception("Job %s failed", job_id)
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["message"] = f"Erro: {e}"
 
 
 @app.post("/extract")
 async def extract_endpoint(
     files: list[UploadFile] = File(..., description="One or more PDF or ZIP files"),
-) -> Response:
+) -> JSONResponse:
     """Main extraction endpoint.
 
     Accepts PDF files and/or ZIP archives containing PDFs.
-    PDFs inside a ZIP are sorted alphabetically to guarantee order.
-
-    Flow:
-    1. Read uploads — extract PDFs from ZIPs if needed.
-    2. Split each PDF into single-page PDFs (preserving order).
-    3. Process PDFs in parallel (pages within each PDF are sequential).
-    4. Consolidate and deduplicate results.
-    5. Generate XLSX and return it.
+    Returns a job_id immediately; use /status/{job_id} to poll progress
+    and /download/{job_id} to fetch the result.
     """
     if not files:
         raise HTTPException(status_code=400, detail="No PDF files uploaded.")
 
+    # Cleanup old jobs on each request
+    _cleanup_old_jobs()
+
     logger.info("Received %d file(s)", len(files))
 
-    # ── Step 1+2: Read uploads, unzip if needed, and split ────────────────
+    # -- Step 1: Read uploads, unzip if needed -----------------------------
     pdf_inputs: list[tuple[bytes, str]] = []
 
     for upload in files:
@@ -169,100 +331,17 @@ async def extract_endpoint(
     if not pdf_inputs:
         raise HTTPException(status_code=400, detail="No PDF files found in the upload.")
 
-    # ── Split each PDF and group pages by PDF ─────────────────────────────
-    pdf_groups: list[list[tuple[bytes, str]]] = []  # one group per PDF
+    # -- Create job and launch background task -----------------------------
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "processing",
+        "progress": 0.0,
+        "message": "Iniciando extra\u00e7\u00e3o...",
+        "xlsx_bytes": None,
+        "error": None,
+        "created_at": time.time(),
+    }
 
-    for file_idx, (pdf_bytes, source_name) in enumerate(pdf_inputs, start=1):
-        logger.info("File %d (%s): %d bytes", file_idx, source_name, len(pdf_bytes))
+    asyncio.create_task(_process_job(job_id, pdf_inputs))
 
-        pages = split_pdf_to_pages(pdf_bytes)
-        logger.info("File %d split into %d pages", file_idx, len(pages))
-
-        group: list[tuple[bytes, str]] = []
-        for page_num, page_bytes in enumerate(pages, start=1):
-            label = f"PDF{file_idx}-P{page_num}"
-            group.append((page_bytes, label))
-        pdf_groups.append(group)
-
-    total_pages = sum(len(g) for g in pdf_groups)
-    logger.info("Total pages to process: %d across %d PDF(s)", total_pages, len(pdf_groups))
-
-    # ── Step 3: Extract — parallel per PDF, sequential per page ───────────
-    all_extractions: list[dict] = []
-    all_labels: list[str] = []
-    all_errors: list[dict] = []
-
-    max_workers = min(len(pdf_groups), 4)
-    if max_workers <= 1:
-        # Single PDF — no need for thread pool overhead
-        ext, lab, err = _process_pdf_pages(pdf_groups[0])
-        all_extractions.extend(ext)
-        all_labels.extend(lab)
-        all_errors.extend(err)
-    else:
-        logger.info("Processing %d PDFs in parallel (max_workers=%d)", len(pdf_groups), max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_process_pdf_pages, group)
-                for group in pdf_groups
-            ]
-            # Collect in original PDF order
-            for future in futures:
-                ext, lab, err = future.result()
-                all_extractions.extend(ext)
-                all_labels.extend(lab)
-                all_errors.extend(err)
-
-    if all_errors:
-        logger.warning("Extraction completed with %d error(s)", len(all_errors))
-        for e in all_errors:
-            logger.warning("  %s: %s", e["pagina"], e["erro"])
-
-    # ── Step 4: Consolidate ───────────────────────────────────────────────
-    rows = consolidate(all_extractions, all_labels)
-    logger.info("Consolidated: %d rows before dedup", len(rows))
-
-    # Smart mask threshold: only generate if ≥80% are missing
-    all_have_masks, missing_count = verificar_mascaras(rows)
-    if all_have_masks:
-        logger.info("All rows have masks — skipping generation")
-    elif rows:
-        ratio = missing_count / len(rows)
-        if ratio >= MASK_GENERATION_THRESHOLD:
-            logger.info(
-                "%d/%d rows missing masks (%.0f%%) — generating via AI",
-                missing_count, len(rows), ratio * 100,
-            )
-            rows = gerar_mascaras(rows)
-        else:
-            logger.info(
-                "Only %d/%d rows missing masks (%.0f%%) — skipping AI mask generation (threshold: %.0f%%)",
-                missing_count, len(rows), ratio * 100, MASK_GENERATION_THRESHOLD * 100,
-            )
-
-    rows = deduplicate(rows)
-    logger.info("After dedup: %d rows", len(rows))
-
-    # Arithmetic validation
-    arithmetic_errors = validar_aritmetica(rows)
-    all_errors.extend(arithmetic_errors)
-    logger.info("Arithmetic validation: %d inconsistencies found", len(arithmetic_errors))
-
-    # Classify accounts against standard chart
-    try:
-        rows = classificar_contas(rows)
-        logger.info("Classification complete")
-    except Exception as exc:
-        logger.error("Classification failed (continuing without): %s", exc)
-
-    # ── Step 5: Generate XLSX ─────────────────────────────────────────────
-    xlsx_bytes = build_xlsx(rows, errors=all_errors)
-    logger.info("XLSX generated: %d bytes", len(xlsx_bytes))
-
-    return Response(
-        content=xlsx_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": 'attachment; filename="balancete_consolidado.xlsx"',
-        },
-    )
+    return JSONResponse(content={"job_id": job_id}, status_code=202)
