@@ -12,6 +12,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from .consolidator import consolidate, deduplicate
@@ -33,6 +34,14 @@ app = FastAPI(
     title="PDF Accounting Data Extractor",
     description="Receives accounting PDFs, extracts balance-sheet data via Gemini AI, returns consolidated XLSX.",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MASK_GENERATION_THRESHOLD = 0.80  # Only auto-generate masks if >=80% are missing
